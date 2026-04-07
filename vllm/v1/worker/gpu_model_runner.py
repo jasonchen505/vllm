@@ -4695,7 +4695,7 @@ class GPUModelRunner(
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
                     scheduler_output,
-                    shift_computed_tokens=1,
+                    shift_computed_tokens=1 if spec_config.use_eagle() else 0,
                 )
             else:
                 mm_embed_inputs = None
