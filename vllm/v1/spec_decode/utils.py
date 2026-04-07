@@ -296,10 +296,12 @@ def copy_and_expand_eagle_inputs_kernel(
     # (Padded) Inputs from the target model
     target_token_ids_ptr,  # [total_tokens_in_batch]
     target_positions_ptr,  # [total_tokens_in_batch]
+    in_is_mm_embed_ptr,  # [total_tokens_in_batch]
     next_token_ids_ptr,  # [num_reqs]
     # Outputs to the drafting buffers
     out_input_ids_ptr,  # [total_draft_tokens_in_batch] (output)
     out_positions_ptr,  # [total_draft_tokens_in_batch] (output)
+    out_is_mm_embed_ptr,  # [total_draft_tokens_in_batch] (output)
     out_is_rejected_token_mask_ptr,  # [total_draft_tokens_in_batch] (output)
     out_is_masked_token_mask_ptr,  # [total_draft_tokens_in_batch] (output)
     out_new_token_indices_ptr,  # [num_padding_slots_per_request * num_reqs] (output)
@@ -313,6 +315,7 @@ def copy_and_expand_eagle_inputs_kernel(
     total_input_tokens,  # tl.int32
     num_padding_slots_per_request,  # tl.int32
     shift_input_ids,  # tl.bool
+    use_mm_embed: tl.constexpr,
     BLOCK_SIZE_TOKENS: tl.constexpr,  # Blocks along token dim to handle prefills
 ):
     """
@@ -381,7 +384,15 @@ def copy_and_expand_eagle_inputs_kernel(
     token_ids = tl.load(
         target_token_ids_ptr + in_idx_clamped, mask=is_valid_region & in_bounds, other=0
     )
-
+    
+    if use_mm_embed:
+        mm_flags = tl.load(
+            in_is_mm_embed_ptr + in_idx_clamped,
+            mask=is_valid_region & in_bounds,
+            other=0,
+        )
+    else:
+        mm_flags = tl.zeros((BLOCK_SIZE_TOKENS,), dtype=tl.int1)
     # Load the starting position for this request (first position in the sequence)
     start_pos = tl.load(target_positions_ptr + query_start_loc)
 
@@ -394,6 +405,7 @@ def copy_and_expand_eagle_inputs_kernel(
         is_parallel_draft_region, parallel_drafting_token_id, token_ids
     )
     token_ids = tl.where(is_rejected_region, padding_token_id, token_ids)
+    mm_flags = tl.where(is_valid_region, mm_flags, 0)
 
     # Build final positions:
     # Positions are NOT shifted - they start from the first input position and increment
@@ -432,6 +444,7 @@ def copy_and_expand_eagle_inputs_kernel(
     # Store outputs
     tl.store(out_input_ids_ptr + out_idx, token_ids, mask=in_bounds)
     tl.store(out_positions_ptr + out_idx, positions, mask=in_bounds)
+    tl.store(out_is_mm_embed_ptr + out_idx, mm_flags, mask=in_bounds)
     tl.store(out_is_rejected_token_mask_ptr + out_idx, is_rejected_out, mask=in_bounds)
     tl.store(out_is_masked_token_mask_ptr + out_idx, is_masked_out, mask=in_bounds)
     tl.store(
