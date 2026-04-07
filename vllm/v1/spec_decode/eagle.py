@@ -141,6 +141,11 @@ class SpecDecodeBaseProposer:
         self.uses_mrope = self.draft_model_config.uses_mrope
         self.uses_xdrope_dim = self.vllm_config.model_config.uses_xdrope_dim
         self.draft_uses_xdrope_dim = self.draft_model_config.uses_xdrope_dim
+        # 1D positions buffer is always needed because
+        # copy_and_expand_eagle_inputs_kernel always writes 1D positions.
+        self.positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
             # position on purpose to make it non-contiguous so that it can work
@@ -161,13 +166,13 @@ class SpecDecodeBaseProposer:
                 dtype=torch.int64,
                 device=device,
             )
-        else:
-            # RoPE need (max_num_tokens,)
-            self.positions = torch.zeros(
-                self.max_positions,
-                dtype=torch.int64,
-                device=device,
-            )
+        # else:
+        #     # RoPE need (max_num_tokens,)
+        #     self.positions = torch.zeros(
+        #         self.max_positions,
+        #         dtype=torch.int64,
+        #         device=device,
+        #     )
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
         )
@@ -184,11 +189,12 @@ class SpecDecodeBaseProposer:
 
         if self.needs_extra_input_slots:
             self._raise_if_padded_drafter_batch_disabled()
-            self._raise_if_multimodal()
-            self._raise_if_mrope()
+            # self._raise_if_multimodal()
+            # self._raise_if_mrope()
 
         self.is_rejected_token_mask: torch.Tensor | None = None
         self.is_masked_token_mask: torch.Tensor | None = None
+        self.expanded_is_mm_embed: torch.Tensor | None = None
         if self.needs_extra_input_slots:
             # For draft models and parallel drafting, we need to keep track of
             # which tokens are rejected to update the slot mapping with padding slots.
@@ -199,6 +205,9 @@ class SpecDecodeBaseProposer:
             # are parallel-padding tokens used to sample at later positions.
             # We populate this tensor even when using draft models for simplicity.
             self.is_masked_token_mask = torch.zeros(
+                (self.max_num_tokens,), dtype=torch.bool, device=device
+            )
+            self.expanded_is_mm_embed = torch.zeros(
                 (self.max_num_tokens,), dtype=torch.bool, device=device
             )
 
@@ -329,11 +338,21 @@ class SpecDecodeBaseProposer:
         elif hasattr(model_hf_config, "ptd_token_id"):
             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
         else:
-            raise ValueError(
-                "For parallel drafting, the draft model config must have "
-                "`pard_token`, `ptd_token_id`, or "
-                "`dflash_config.mask_token_id` specified in its config.json."
-            )
+            # raise ValueError(
+            #     "For parallel drafting, the draft model config must have "
+            #     "`pard_token`, `ptd_token_id`, or "
+            #     "`dflash_config.mask_token_id` specified in its config.json."
+            # )
+            # Runtime fallback: derive <mask> id from tokenizer and backfill for paddleocrvl
+            from vllm.tokenizers import cached_tokenizer_from_config
+            tokenizer = cached_tokenizer_from_config(self.draft_model_config)
+            mask_token_id = tokenizer.convert_tokens_to_ids("<mask>") if tokenizer else None
+            if not isinstance(mask_token_id, int) or mask_token_id < 0:
+                raise ValueError(
+                    "For parallel drafting, `pard_token`/`ptd_token_id` are missing "
+                    "and a valid `<mask>` token id cannot be resolved from tokenizer."
+                )
+            self.parallel_drafting_token_id = model_hf_config.ptd_token_id = mask_token_id
 
         if self.pass_hidden_states_to_model:
             self.parallel_drafting_hidden_state_tensor = torch.empty(
@@ -356,7 +375,7 @@ class SpecDecodeBaseProposer:
             # Convert M-RoPE positions if target model uses M-RoPE
             # but draft doesn't, For text inputs, all M-RoPE
             # dimensions are identical
-            if self.vllm_config.model_config.uses_mrope:
+            if self.vllm_config.model_config.uses_mrope and positions.ndim > 1:
                 positions = positions[0]
             self.positions[:num_tokens] = positions
 
@@ -436,7 +455,7 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata = (
+        num_tokens, token_indices_to_sample, common_attn_metadata,mm_embed_inputs = (
             self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
@@ -445,6 +464,7 @@ class SpecDecodeBaseProposer:
                 token_indices_to_sample=token_indices_to_sample,
                 cad=common_attn_metadata,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                mm_embed_inputs=mm_embed_inputs,
             )
         )
 
@@ -652,7 +672,8 @@ class SpecDecodeBaseProposer:
         token_indices_to_sample: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
-    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata,tuple[list[torch.Tensor], torch.Tensor] | None]:
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,
@@ -675,10 +696,11 @@ class SpecDecodeBaseProposer:
 
             self.hidden_states[:num_tokens] = target_hidden_states
 
-            return num_tokens, token_indices_to_sample, cad
+            return num_tokens, token_indices_to_sample, cad, mm_embed_inputs
         else:
             assert self.is_rejected_token_mask is not None
             assert self.is_masked_token_mask is not None
+            assert self.expanded_is_mm_embed is not None
             # 1.
             # Call a custom triton kernel to copy input_ids and positions
             # into the correct slots in the preallocated buffers self.input_ids,
@@ -699,6 +721,13 @@ class SpecDecodeBaseProposer:
             total_num_output_tokens = total_num_input_tokens + (
                 self.net_num_new_slots_per_request * batch_size
             )
+            if (self.supports_mm_inputs and mm_embed_inputs is not None):
+                mm_embeds, input_is_mm_embed = mm_embed_inputs
+                use_mm_embed = True
+            else:
+                mm_embeds = None
+                input_is_mm_embed = self.expanded_is_mm_embed
+                use_mm_embed = False
 
             token_indices_to_sample = torch.empty(
                 batch_size * self.extra_slots_per_request,
@@ -717,14 +746,52 @@ class SpecDecodeBaseProposer:
             query_end_loc = cad.query_start_loc[1:] - 1
             if num_rejected_tokens_gpu is not None:
                 query_end_loc = query_end_loc - num_rejected_tokens_gpu
+                
+            extend_lens_batch = query_start_loc[1 : batch_size + 1] - query_start_loc[:batch_size]
+            req_ranks = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.long, device=self.device),
+                extend_lens_batch.long(),
+                output_size=total_num_input_tokens,
+            )
+            out_indices_for_input = torch.arange(
+                total_num_input_tokens, dtype=torch.long, device=self.device
+            ) + req_ranks * self.net_num_new_slots_per_request
+
+            kernel_positions = target_positions
+            if self.vllm_config.model_config.uses_mrope:
+                if not self.uses_mrope:
+                    num_computed = cad.seq_lens[:batch_size] - extend_lens_batch
+                    query_start_expanded = torch.repeat_interleave(
+                        query_start_loc[:batch_size].long(),
+                        extend_lens_batch.long(),
+                        output_size=total_num_input_tokens,
+                    )
+                    token_offsets = (
+                        torch.arange(
+                            total_num_input_tokens,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        - query_start_expanded
+                    )
+                    kernel_positions = num_computed[req_ranks].to(
+                        target_positions.dtype
+                    ) + token_offsets.to(target_positions.dtype)
+                else:
+                    kernel_positions = target_positions[0]
+            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
+                kernel_positions = target_positions[0]
+                
             copy_and_expand_eagle_inputs_kernel[grid](
                 # (Padded) Inputs from the target model
                 target_token_ids_ptr=target_token_ids,
-                target_positions_ptr=target_positions,
+                target_positions_ptr=kernel_positions,
+                in_is_mm_embed_ptr=input_is_mm_embed,
                 next_token_ids_ptr=next_token_ids,  # sampled tokens, one per request
                 # Outputs to the drafting buffers
                 out_input_ids_ptr=self.input_ids,
                 out_positions_ptr=self.positions,  # Doesn't support mrope for now
+                out_is_mm_embed_ptr=self.expanded_is_mm_embed,
                 out_is_rejected_token_mask_ptr=self.is_rejected_token_mask,
                 out_is_masked_token_mask_ptr=self.is_masked_token_mask,
                 out_new_token_indices_ptr=token_indices_to_sample,
@@ -739,6 +806,7 @@ class SpecDecodeBaseProposer:
                 total_input_tokens=total_num_input_tokens,
                 num_padding_slots_per_request=self.extra_slots_per_request,
                 shift_input_ids=self.pass_hidden_states_to_model,
+                use_mm_embed=use_mm_embed,
                 BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
             )
             if self.pass_hidden_states_to_model:
@@ -753,6 +821,44 @@ class SpecDecodeBaseProposer:
                     out=self.hidden_states[:total_num_output_tokens],
                 )
 
+            if self.uses_mrope:
+                self.mrope_positions[:, :total_num_output_tokens].zero_()
+                if self.vllm_config.model_config.uses_mrope:
+                    self.mrope_positions[:, out_indices_for_input] = target_positions[:, :total_num_input_tokens]
+                    last_valid_times = target_positions[0, query_end_loc.long()]
+                    base_times = torch.repeat_interleave(
+                        last_valid_times,
+                        self.extra_slots_per_request,
+                        output_size=batch_size * self.extra_slots_per_request,
+                    )
+                    increments = torch.arange(
+                        1,
+                        self.extra_slots_per_request + 1,
+                        dtype=last_valid_times.dtype,
+                        device=self.device,
+                    ).repeat(batch_size)
+                    self.mrope_positions[:, token_indices_to_sample.long()] = (base_times + increments).unsqueeze(0)
+                else:
+                    self.mrope_positions[:, :total_num_output_tokens] = self.positions[:total_num_output_tokens]
+            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                self.xdrope_positions[:, :total_num_output_tokens].zero_()
+                if target_positions.ndim > 1:
+                    self.xdrope_positions[:, out_indices_for_input] = target_positions[:, :total_num_input_tokens]
+                    last_valid_positions = target_positions[:, query_end_loc.long()]
+                    base_positions = torch.repeat_interleave(
+                        last_valid_positions,
+                        self.extra_slots_per_request,
+                        dim=1,
+                    )
+                    increments = torch.arange(
+                        1,
+                        self.extra_slots_per_request + 1,
+                        dtype=last_valid_positions.dtype,
+                        device=self.device,
+                    ).repeat(batch_size)
+                    self.xdrope_positions[:, token_indices_to_sample.long()] = (base_positions + increments.unsqueeze(0))
+                else:
+                    self.xdrope_positions[:, :total_num_output_tokens] = self.positions[:total_num_output_tokens]
             # 2.
             # Recompute the slot mapping based on the new positions and
             # rejection mask.
@@ -776,7 +882,12 @@ class SpecDecodeBaseProposer:
                 new_slot_mapping=new_slot_mapping,
             )
 
-            return total_num_output_tokens, token_indices_to_sample, new_cad
+            if use_mm_embed and mm_embeds is not None:
+                output_mm_embed_inputs = (mm_embeds,self.expanded_is_mm_embed[:total_num_output_tokens],)
+            else:
+                output_mm_embed_inputs = None
+
+            return (total_num_output_tokens,token_indices_to_sample,new_cad,output_mm_embed_inputs,)
 
     def build_model_inputs_first_pass(
         self,
@@ -1329,6 +1440,7 @@ class SpecDecodeBaseProposer:
                 "GlmOcrForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "PaddleOCRVLForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = target_model.config.image_token_id
             elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
