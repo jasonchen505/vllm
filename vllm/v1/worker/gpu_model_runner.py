@@ -4692,10 +4692,15 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
-            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+            if (
+                self.supports_mm_inputs
+                and self.drafter.supports_mm_inputs
+                and self.drafter.pass_hidden_states_to_model
+            ):
+                shift = 1 if self.drafter.pass_hidden_states_to_model else 0
                 mm_embed_inputs = self._gather_mm_embeddings(
                     scheduler_output,
-                    shift_computed_tokens=1 if spec_config.use_eagle() else 0,
+                    shift_computed_tokens=shift,
                 )
             else:
                 mm_embed_inputs = None

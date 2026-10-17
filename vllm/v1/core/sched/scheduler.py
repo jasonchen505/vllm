@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -83,6 +84,21 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.log_spec_decode_per_request = (
+            os.getenv("VLLM_LOG_SPEC_DECODE_PER_REQUEST", "0") == "1"
+        )
+        if self.log_spec_decode_per_request:
+            speculative_config = vllm_config.speculative_config
+            logger.warning(
+                "Per-request spec decode logging enabled: pid=%d module=%s "
+                "spec_enabled=%s method=%s num_spec_tokens=%s parallel_drafting=%s",
+                os.getpid(),
+                __file__,
+                speculative_config is not None,
+                getattr(speculative_config, "method", None),
+                getattr(speculative_config, "num_speculative_tokens", None),
+                getattr(speculative_config, "parallel_drafting", None),
+            )
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -516,6 +532,18 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            if self.log_spec_decode_per_request:
+                logger.info(
+                    "SpecDecode schedule: req_id=%s scheduled=%d spec_buffered=%d "
+                    "num_computed=%d num_tokens=%d placeholders=%d prefill_chunk=%s",
+                    request_id,
+                    num_new_tokens,
+                    len(request.spec_token_ids),
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                    request.num_output_placeholders,
+                    request.is_prefill_chunk,
+                )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1369,6 +1397,18 @@ class Scheduler(SchedulerInterface):
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
+                if self.log_spec_decode_per_request:
+                    acceptance_rate = (
+                        num_accepted / num_draft_tokens if num_draft_tokens > 0 else 0.0
+                    )
+                    logger.info(
+                        "SpecDecode round: req_id=%s draft=%d accepted=%d "
+                        "acceptance=%.3f",
+                        req_id,
+                        num_draft_tokens,
+                        num_accepted,
+                        acceptance_rate,
+                    )
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1387,6 +1427,14 @@ class Scheduler(SchedulerInterface):
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
+                )
+            elif self.log_spec_decode_per_request:
+                logger.info(
+                    "SpecDecode round skipped: req_id=%s has_scheduled_spec=%s "
+                    "generated_tokens=%d",
+                    req_id,
+                    bool(scheduled_spec_token_ids),
+                    len(generated_token_ids),
                 )
 
             stopped = False
@@ -1679,18 +1727,39 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request may have been finished. Skip.
+                if self.log_spec_decode_per_request:
+                    logger.info(
+                        "SpecDecode draft update skipped: req_id=%s reason=%s",
+                        req_id,
+                        "request_not_found"
+                        if request is None
+                        else f"request_finished:{request.status.name}",
+                    )
                 continue
 
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                if self.log_spec_decode_per_request:
+                    logger.info(
+                        "SpecDecode draft skipped: req_id=%s reason=prefill_chunk",
+                        req_id,
+                    )
                 continue
 
             # Add newly generated spec token ids to the request.
+            raw_num_spec_tokens = len(spec_token_ids)
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            if self.log_spec_decode_per_request:
+                logger.info(
+                    "SpecDecode draft update: req_id=%s raw=%d kept=%d",
+                    req_id,
+                    raw_num_spec_tokens,
+                    len(spec_token_ids),
+                )
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1710,6 +1779,12 @@ class Scheduler(SchedulerInterface):
 
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
             if not placeholder_spec_tokens:
+                if self.log_spec_decode_per_request:
+                    logger.info(
+                        "SpecDecode output update skipped: req_id=%s "
+                        "reason=no_placeholder_spec_tokens",
+                        req_id,
+                    )
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
@@ -1754,6 +1829,16 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.log_spec_decode_per_request:
+                logger.info(
+                    "SpecDecode request added: req_id=%s prompt_tokens=%d "
+                    "max_tokens=%d mm_inputs=%d resumable=%s",
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    request.max_tokens,
+                    request.num_encoder_inputs,
+                    request.resumable,
+                )
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
